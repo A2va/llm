@@ -1,5 +1,5 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use xmake::Config;
 
@@ -9,12 +9,9 @@ use xmake::Config;
 fn main() {
     println!("cargo:rerun-if-changed=llama-cpp");
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is not defined"));
-
     let target = "ggml";
     let mut config = Config::new("llama-cpp");
     // Set mode and target name
-    config.mode(env::var("PROFILE").unwrap().as_str());
     config.target(target);
 
     // Acceleration option

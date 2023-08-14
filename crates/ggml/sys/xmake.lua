@@ -2,10 +2,10 @@
 
 set_allowedplats("windows", "linux", "macosx", "wasm")
 
-add_rules("mode.release", "mode.debug")
+add_rules("mode.release", "mode.debug", "mode.releasedbg", "mode.minsizerel")
 
 option("accelerate", {default = is_plat("macosx"), description  = "Enable Accelerate framework"})
-option("metal", {default = is_plat("macosx"), description  = "Enable Accelerate framework"})
+option("metal", {default = is_plat("macosx"), description  = "Enable Metal framework"})
 
 option("clblast", {default = true, description  = "Enable OpenCL acceleration"})
 option("openblas", {default = false, description  = "Enable OpenBLAS acceleration"})
@@ -34,7 +34,7 @@ option_callback("cublas", "cuda", add_requires)
 target("ggml")
 
     on_load(function (target)
-        if has_config("accelerate") then
+        if has_config("metal") then
             -- HACK: patch ggml-metal.m so that it includes ggml-metal.metal, so that
             -- a runtime dependency is not necessary
             local data = io.readfile("llama-cpp/ggml-metal.metal")
@@ -45,7 +45,6 @@ target("ggml")
             io.replace("llama-cpp/ggml-metal.m", [[#define metal_printf(...) fprintf(stderr, __VA_ARGS__)]], [[#define metal_printf(...) fprintf(stderr, __VA_ARGS__)]],  {plain = true})
         end
     end)
-
 
     set_kind("static")
     set_languages("cxx11","c11")
@@ -105,18 +104,12 @@ target("ggml")
     if is_arch("x86_64", "x64", "i386", "x86") then
         option_callback("avx", "avx", add_vectorexts)
         option_callback("avx2", "avx2", add_vectorexts)
+        option_callback("sse", "sse3", add_vectorexts)
+        option_callback("fma", "fma", add_vectorexts)
         -- option_callback("avx512", "avx512", add_vectorexts)
 
-        if not is_plat("windows") then
-            if has_config("sse") then
-                add_vectorexts("sse3")
-            end
-            if has_config("fma") then
-                add_vectorexts("fma")
-            end
-            if has_config("f16c") then
-                add_cflags("-mf16c")
-            end
+        if not is_plat("windows") and has_config("f16c") then
+            add_cxflags("-mf16c")
         end
     elseif is_arch("arm.*") then
         add_vectorexts("neon")
