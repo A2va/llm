@@ -3,7 +3,7 @@
 //! It exposes a subset of operations (currently used to implement the [llm](https://crates.io/crates/llm) library).
 //! Note that it does not expose a fully-idiomatic safe Rust interface; operations that could be potentially unsafe are marked as such.
 //!
-//! `ggml` operates on a computational graph; no values will be computed until [Context::graph_compute] is executed.
+//! `ggml` operates on a computational graph; no values will be computed until the [Context] is executed via an [GraphExecutionPlan].
 //! All [Tensor]s are nodes in this computational graph, and values cannot be retrieved until computation is completed.
 #![deny(missing_docs)]
 
@@ -18,16 +18,16 @@ mod tensor;
 pub mod format;
 pub mod util;
 
-pub use context::Context;
+pub mod accelerator;
+
+pub use context::{Context, ContextStorage};
+
 pub use tensor::Tensor;
 
 pub use ggml_sys as sys;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(feature = "metal")]
-pub mod metal;
 
 /// The type of a tensor element.
 pub type ElementType = Type;
@@ -75,7 +75,11 @@ impl ContainerType {
                 let version = util::read_u32(reader)?;
                 ContainerType::Ggla(version)
             }
-            magic => return Err(crate::format::LoadError::InvalidMagic(magic)),
+            magic => {
+                return Err(crate::format::LoadError::InvalidMagic(format::FormatMagic(
+                    magic,
+                )))
+            }
         };
 
         Ok(container_type)
@@ -121,6 +125,32 @@ pub const QNT_VERSION_FACTOR: u32 = sys::GGML_QNT_VERSION_FACTOR;
 /// The size of a `ggml` object.
 pub const OBJECT_SIZE: usize = sys::GGML_OBJECT_SIZE;
 
+/// The maximum length of a `ggml` tensor-name.
+pub const MAX_NAME_LENGTH: usize = sys::GGML_MAX_NAME as usize;
+
+/// Default epsilon to use for RMS computation.
+pub const DEFAULT_EPS: f32 = sys::llama::LLAMA_DEFAULT_RMS_EPS as f32;
+
+/// Value overrides to use for RoPE.
+///
+/// Formula: `theta_i = scale * base^(−2(i−1)/d), for i in [1, 2, ..., d/2]`
+#[derive(Debug, Clone)]
+pub struct RoPEOverrides {
+    /// The frequency scale to use.
+    pub frequency_scale: f32,
+    /// The frequency base value to use.
+    pub frequency_base: usize,
+}
+
+impl Default for RoPEOverrides {
+    fn default() -> Self {
+        Self {
+            frequency_scale: 1.0,
+            frequency_base: 10_000,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 /// The type of a value in `ggml`.
 pub enum Type {
@@ -158,6 +188,8 @@ pub enum Type {
     F16,
     /// Float 32-bit.
     F32,
+    /// Integer 8-bit.
+    I8,
 }
 impl From<Type> for sys::ggml_type {
     fn from(t: Type) -> Self {
@@ -176,6 +208,7 @@ impl From<Type> for sys::ggml_type {
             Type::I32 => sys::ggml_type_GGML_TYPE_I32,
             Type::F16 => sys::ggml_type_GGML_TYPE_F16,
             Type::F32 => sys::ggml_type_GGML_TYPE_F32,
+            Type::I8 => sys::ggml_type_GGML_TYPE_I8,
         }
     }
 }
@@ -197,6 +230,7 @@ impl TryFrom<sys::ggml_type> for Type {
             sys::ggml_type_GGML_TYPE_I32 => Ok(Type::I32),
             sys::ggml_type_GGML_TYPE_F16 => Ok(Type::F16),
             sys::ggml_type_GGML_TYPE_F32 => Ok(Type::F32),
+            sys::ggml_type_GGML_TYPE_I8 => Ok(Type::I8),
 
             _ => Err(()),
         }
@@ -219,6 +253,7 @@ impl std::fmt::Display for Type {
             Type::I32 => write!(f, "i32"),
             Type::F16 => write!(f, "f16"),
             Type::F32 => write!(f, "f32"),
+            Type::I8 => write!(f, "i8"),
         }
     }
 }
@@ -240,6 +275,7 @@ impl Type {
             Type::I32 => false,
             Type::F16 => false,
             Type::F32 => false,
+            Type::I8 => false,
         }
     }
 }
@@ -247,6 +283,7 @@ impl Type {
 /// A buffer of memory that can be used as a scratch buffer for a [Context].
 ///
 /// See [Context::use_scratch].
+#[derive(PartialEq, Eq)]
 pub struct Buffer {
     data: *mut c_void,
     layout: Layout,
@@ -283,25 +320,60 @@ impl Drop for Buffer {
 
 /// A `ggml` computation graph. Keeps track of all state during computation.
 pub struct ComputationGraph {
-    inner: sys::ggml_cgraph,
+    inner: *mut sys::ggml_cgraph,
 }
 
 impl ComputationGraph {
-    /// Create a new [ComputationGraph] with the specified `n_threads`.
-    pub fn new(n_threads: usize) -> Self {
-        Self {
-            inner: sys::ggml_cgraph {
-                n_threads: usize_to_i32(n_threads),
-                // SAFETY: This should be safe to zero. The original C++ impl
-                // just leaves it uninitialized
-                ..unsafe { std::mem::zeroed::<sys::ggml_cgraph>() }
-            },
-        }
+    /// Create a new [ComputationGraph] from a raw [sys::ggml_cgraph].
+    pub fn from_raw(raw_context: *mut sys::ggml_cgraph) -> Self {
+        Self { inner: raw_context }
     }
 
     /// Build this computational graph in the forward direction in preparation for computation.
     pub fn build_forward_expand(&mut self, tensor: &Tensor) {
-        unsafe { sys::ggml_build_forward_expand(&mut self.inner, tensor.ptr.as_ptr()) }
+        unsafe { sys::ggml_build_forward_expand(self.inner, tensor.ptr.as_ptr()) }
+    }
+}
+
+/// A `ggml` execution plan. Contains the information needed to execute a computation graph.
+pub struct GraphExecutionPlan {
+    inner: sys::ggml_cplan,
+    inner_graph: *mut sys::ggml_cgraph,
+}
+
+impl GraphExecutionPlan {
+    /// Create a new [GraphExecutionPlan] from a [ComputationGraph] and the number of threads to use.
+    pub fn new(graph: &mut ComputationGraph, n_threads: usize) -> Self {
+        Self {
+            inner: unsafe { sys::ggml_graph_plan(graph.inner, usize_to_i32(n_threads)) },
+            inner_graph: graph.inner,
+        }
+    }
+
+    /// Creates a [Type::I8] work buffer with size `plan.work_size` for this [GraphExecutionPlan] in the given [Context].
+    fn create_work_buffer(&mut self, context: &Context) -> Tensor {
+        context.new_tensor_1d(Type::I8, self.inner.work_size)
+    }
+
+    /// Assign a work buffer to this [GraphExecutionPlan].
+    fn assign_work_buffer(&mut self, buffer: &mut Tensor) {
+        assert!(
+            buffer.get_type() == Type::I8,
+            "Work buffer must be of type i8"
+        );
+        unsafe {
+            self.inner.work_data = buffer.data().cast();
+        }
+    }
+
+    /// Execute this [GraphExecutionPlan] in the given [Context].
+    pub fn execute(&mut self, context: &Context) {
+        let mut work_buffer = self.create_work_buffer(context);
+        self.assign_work_buffer(&mut work_buffer);
+
+        unsafe {
+            sys::ggml_graph_compute(self.inner_graph, &mut self.inner);
+        }
     }
 }
 
@@ -420,8 +492,7 @@ pub fn cpu_has_gpublas() -> bool {
     unsafe { sys::ggml_cpu_has_gpublas() != 0 }
 }
 
-/// Sets the name of a tensor.
-pub fn set_name(tensor: &Tensor, name: &str) {
-    let c_name = std::ffi::CString::new(name).unwrap();
-    unsafe { sys::ggml_set_name(tensor.ptr.as_ptr(), c_name.as_ptr()) };
+/// Returns the graph overhead in bytes.
+pub fn graph_overhead() -> usize {
+    unsafe { sys::ggml_graph_overhead() }
 }

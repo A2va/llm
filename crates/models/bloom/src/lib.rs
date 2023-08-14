@@ -7,8 +7,8 @@ use std::sync::Arc;
 use llm_base::{
     ggml,
     model::{common, HyperparametersWriteError},
-    util, FileType, GraphOutputs, InferenceParameters, InferenceSession, InferenceSessionConfig,
-    KnownModel, ModelParameters, OutputRequest, Regex, TokenId, Tokenizer,
+    util, FileType, GraphOutputs, InferenceSession, InferenceSessionConfig, KnownModel,
+    ModelParameters, OutputRequest, Regex, TokenId, Tokenizer,
 };
 
 /// The BLOOM model. Ref: [Introducing BLOOM](https://bigscience.huggingface.co/blog/bloom)
@@ -16,8 +16,7 @@ use llm_base::{
 /// # Safety
 /// This implements [Send] and [Sync] as it is immutable after construction.
 pub struct Bloom {
-    // the context size ("memory") the model should use when evaluating a prompt
-    context_size: usize,
+    params: ModelParameters,
 
     hyperparameters: Hyperparameters,
     tokenizer: Tokenizer,
@@ -89,13 +88,11 @@ impl KnownModel for Bloom {
             layers.push(layer);
         }
 
-        let (context, _) = tl.finish();
-
-        let ModelParameters { context_size, .. } = params;
+        let context = tl.finish();
 
         Ok(Bloom {
             hyperparameters,
-            context_size,
+            params,
             tokenizer,
             wte,
             norm,
@@ -111,7 +108,7 @@ impl KnownModel for Bloom {
     fn start_session(&self, config: InferenceSessionConfig) -> InferenceSession {
         InferenceSession::new(
             config,
-            self.context_size,
+            &self.params,
             self.hyperparameters.n_layer,
             self.hyperparameters.n_embd,
             self.hyperparameters.n_vocab,
@@ -121,14 +118,12 @@ impl KnownModel for Bloom {
     fn evaluate(
         &self,
         session: &mut InferenceSession,
-        params: &InferenceParameters,
         input_tokens: &[TokenId],
         output_request: &mut OutputRequest,
     ) {
         let input_len = input_tokens.len();
         let session_len = session.n_past;
-        let num_threads = params.n_threads;
-        let ctx_size = self.context_size;
+        let ctx_size = self.params.context_size;
 
         let Hyperparameters {
             n_vocab,
@@ -140,7 +135,7 @@ impl KnownModel for Bloom {
         } = self.hyperparameters;
 
         let outputs = session.compute(self.context.clone(), input_tokens, |builder| {
-            let ctx0 = builder.ctx0;
+            let ctx0 = builder.ctx0.borrow();
             let (memory_k_size, memory_v_size) = (
                 builder.memory_k.element_size(),
                 builder.memory_v.element_size(),
@@ -150,10 +145,10 @@ impl KnownModel for Bloom {
 
             // normalize embeddings
             input_layer = ctx0.op_norm(&input_layer);
-            input_layer = ctx0.op_mul(&ctx0.op_repeat(&self.norm, &input_layer), &input_layer);
-            input_layer = ctx0.op_add(&ctx0.op_repeat(&self.norm_bias, &input_layer), &input_layer);
+            input_layer = ctx0.op_mul(&input_layer, &self.norm);
+            input_layer = ctx0.op_add(&input_layer, &self.norm_bias);
 
-            let mut gf = ggml::ComputationGraph::new(num_threads);
+            let mut gf = ctx0.create_compute_graph();
             for il in 0..n_layer {
                 let input_self_attention = input_layer.share();
                 let mut current: ggml::Tensor;
@@ -162,21 +157,12 @@ impl KnownModel for Bloom {
                 current = ctx0.op_norm(&input_layer);
 
                 // cur = attention_norm * cur
-                current = ctx0.op_mul(
-                    &ctx0.op_repeat(&self.layers[il].attention_norm, &current),
-                    &current,
-                );
-                current = ctx0.op_add(
-                    &ctx0.op_repeat(&self.layers[il].attention_norm_b, &current),
-                    &current,
-                );
+                current = ctx0.op_mul(&current, &self.layers[il].attention_norm);
+                current = ctx0.op_add(&current, &self.layers[il].attention_norm_b);
 
                 //attention
                 current = ctx0.op_mul_mat(&self.layers[il].query_key_value, &current);
-                current = ctx0.op_add(
-                    &ctx0.op_repeat(&self.layers[il].query_key_value_b, &current),
-                    &current,
-                );
+                current = ctx0.op_add(&current, &self.layers[il].query_key_value_b);
 
                 // self-attention
                 let nb = current.get_nb()[1];
@@ -298,7 +284,7 @@ impl KnownModel for Bloom {
 
                 // projection
                 current = ctx0.op_mul_mat(&self.layers[il].wo, &current);
-                current = ctx0.op_add(&ctx0.op_repeat(&self.layers[il].wo_b, &current), &current);
+                current = ctx0.op_add(&current, &self.layers[il].wo_b);
 
                 let input_feed_forward = ctx0.op_add(&current, &input_self_attention);
 
@@ -307,19 +293,13 @@ impl KnownModel for Bloom {
                 current = ctx0.op_norm(&input_feed_forward);
 
                 // cur = ffn_norm*cur + ffn_norm_b
-                current = ctx0.op_mul(
-                    &ctx0.op_repeat(&self.layers[il].ffn_norm, &current),
-                    &current,
-                );
+                current = ctx0.op_mul(&current, &self.layers[il].ffn_norm);
 
-                current = ctx0.op_add(
-                    &ctx0.op_repeat(&self.layers[il].ffn_norm_b, &current),
-                    &current,
-                );
+                current = ctx0.op_add(&current, &self.layers[il].ffn_norm_b);
 
                 current = ctx0.op_mul_mat(&self.layers[il].w1, &current);
 
-                current = ctx0.op_add(&ctx0.op_repeat(&self.layers[il].w1_b, &current), &current);
+                current = ctx0.op_add(&current, &self.layers[il].w1_b);
 
                 // SILU activation
 
@@ -327,7 +307,7 @@ impl KnownModel for Bloom {
 
                 current = ctx0.op_mul_mat(&self.layers[il].w2, &current);
 
-                current = ctx0.op_add(&ctx0.op_repeat(&self.layers[il].w2_b, &current), &current);
+                current = ctx0.op_add(&current, &self.layers[il].w2_b);
 
                 current = ctx0.op_add(&current, &input_feed_forward);
 
@@ -339,15 +319,9 @@ impl KnownModel for Bloom {
             input_layer = ctx0.op_norm(&input_layer);
 
             // inpL = norm*inpL
-            input_layer = ctx0.op_mul(
-                &ctx0.op_repeat(&self.output_norm, &input_layer),
-                &input_layer,
-            );
+            input_layer = ctx0.op_mul(&input_layer, &self.output_norm);
 
-            input_layer = ctx0.op_add(
-                &ctx0.op_repeat(&self.output_norm_bias, &input_layer),
-                &input_layer,
-            );
+            input_layer = ctx0.op_add(&input_layer, &self.output_norm_bias);
 
             let embeddings_tensor: ggml::Tensor = input_layer.share();
 
@@ -378,7 +352,7 @@ impl KnownModel for Bloom {
     }
 
     fn context_size(&self) -> usize {
-        self.context_size
+        self.params.context_size
     }
 
     fn bot_token_id(&self) -> Option<TokenId> {
@@ -395,6 +369,10 @@ impl KnownModel for Bloom {
 
     fn skip_quantize_tensors() -> Vec<Regex> {
         vec![]
+    }
+
+    fn supports_rewind(&self) -> bool {
+        true
     }
 }
 

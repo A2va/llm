@@ -100,7 +100,7 @@ opt-level = 3
 
 The `llm` library is engineered to take advantage of hardware accelerators such as `cuda` and `metal` for optimized performance.
 
-To enable `llm` to harness these accelerators, some preliminary configuration steps are necessary, which vary based on your operating system. For comprehensive guidance, please refer to the [Acceleration Support for Building section](doc/CONTRIBUTING.md#acceleration-support-for-building) in our documentation.
+To enable `llm` to harness these accelerators, some preliminary configuration steps are necessary, which vary based on your operating system. For comprehensive guidance, please refer to [Acceleration Support](doc/acceleration-support.md) in our documentation.
 
 ## Using `llm` from Other Languages
 
@@ -192,8 +192,7 @@ of GGML models.
 
 ### r/LocalLLaMA
 
-This Reddit community maintains
-[a wiki](https://www.reddit.com/r/LocalLLaMA/wiki/index/) related to GGML
+This Reddit community maintains a wiki related to GGML
 models, including well organized lists of links for acquiring
 [GGML models](https://www.reddit.com/r/LocalLLaMA/wiki/models/) (mostly from
 Hugging Face 🤗).
@@ -262,7 +261,7 @@ can be used to cache prompts to reduce load time, too.
 `f16`-quantized GGML model
 
 ```shell
-cargo run --release $MODEL_ARCHITECTURE quantize $MODEL_IN $MODEL_OUT {q4_0,q4_1}
+cargo run --release quantize -a $MODEL_ARCHITECTURE $MODEL_IN $MODEL_OUT {q4_0,q4_1}
 ```
 
 ### Do you provide support for Docker and NixOS?
@@ -289,6 +288,7 @@ Absolutely! Please see the [contributing guide](./doc/CONTRIBUTING.md).
 - [local.ai](https://github.com/louisgv/local.ai): Desktop app for hosting an
   inference API on your local machine using `llm`.
 - [secondbrain](https://github.com/juliooa/secondbrain): Desktop app to download and run LLMs locally in your computer using `llm`.
+- [floneum](https://floneum.com/): A graph editor for local AI workflows.
 
 #### Libraries
 

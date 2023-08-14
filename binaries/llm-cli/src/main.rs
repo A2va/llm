@@ -1,28 +1,26 @@
 use std::{
     convert::Infallible,
     fs::File,
-    io::{BufReader, BufWriter, Write},
+    io::{BufReader, BufWriter},
 };
 
 use clap::Parser;
 use cli_args::Args;
-use color_eyre::eyre::{bail, Context, ContextCompat, Result};
-use llm::{InferenceError, InferenceFeedback, InferenceResponse};
-use rustyline::{
-    error::ReadlineError,
-    history::DefaultHistory,
-    validate::{ValidationContext, ValidationResult, Validator},
-    Cmd, Completer, Helper, Highlighter, Hinter, KeyCode, KeyEvent, Modifiers,
-};
+use color_eyre::eyre::{self, Context, ContextCompat};
+use is_terminal::IsTerminal;
 
 mod cli_args;
+mod interactive;
 mod snapshot;
+mod util;
 
-fn main() -> Result<()> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
+fn main() -> eyre::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
+
     color_eyre::install()?;
 
     let args = Args::parse();
@@ -31,13 +29,14 @@ fn main() -> Result<()> {
         Args::Perplexity(args) => perplexity(&args),
         Args::Info(args) => info(&args),
         Args::PromptTokens(args) => prompt_tokens(&args),
-        Args::Repl(args) => repl(&args),
-        Args::Chat(args) => chat(&args),
+        Args::Repl(args) => interactive::repl(&args),
+        Args::Chat(args) => interactive::chat(&args),
         Args::Quantize(args) => quantize(&args),
     }
 }
 
-fn infer(args: &cli_args::Infer) -> Result<()> {
+#[tracing::instrument(skip_all)]
+fn infer(args: &cli_args::Infer) -> eyre::Result<()> {
     let prompt = load_prompt_file_with_prompt(&args.prompt_file, args.prompt.as_deref())?;
     let inference_session_config = args.generate.inference_session_config();
     let model = args.model_load.load(args.generate.use_gpu)?;
@@ -45,57 +44,66 @@ fn infer(args: &cli_args::Infer) -> Result<()> {
     let (mut session, session_loaded) = snapshot::read_or_create_session(
         model.as_ref(),
         args.persist_session.as_deref(),
-        args.generate.load_session.as_deref(),
+        args.load_session.as_deref(),
         inference_session_config,
     );
-    let parameters = args.generate.inference_parameters(model.eot_token_id());
+    let parameters = args
+        .generate
+        .inference_parameters(model.eot_token_id(), model.tokenizer().len())?;
 
     let mut rng = args.generate.rng();
-    let res = session.infer::<Infallible>(
-        model.as_ref(),
-        &mut rng,
-        &llm::InferenceRequest {
-            prompt: prompt.as_str().into(),
-            parameters: &parameters,
-            play_back_previous_tokens: session_loaded,
-            maximum_token_count: args.generate.num_predict,
-        },
-        // OutputRequest
-        &mut Default::default(),
-        |r| match &r {
-            InferenceResponse::PromptToken(t) | InferenceResponse::InferredToken(t) => {
-                if matches!(&r, InferenceResponse::PromptToken(_)) && args.hide_prompt {
-                    return Ok(InferenceFeedback::Continue);
+
+    let span = tracing::trace_span!("infer");
+
+    span.in_scope(|| {
+        // do work inside the span...
+        let res = session.infer::<Infallible>(
+            model.as_ref(),
+            &mut rng,
+            &llm::InferenceRequest {
+                prompt: prompt.as_str().into(),
+                parameters: &parameters,
+                play_back_previous_tokens: session_loaded,
+                maximum_token_count: args.generate.num_predict,
+            },
+            // OutputRequest
+            &mut Default::default(),
+            |r| {
+                match r {
+                    llm::InferenceResponse::PromptToken(t) if !args.hide_prompt => {
+                        util::print_token(t)
+                    }
+                    llm::InferenceResponse::InferredToken(t) => util::print_token(t),
+                    _ => {}
                 }
+                Ok(llm::InferenceFeedback::Continue)
+            },
+        );
 
-                print!("{t}");
-                std::io::stdout().flush().unwrap();
+        println!();
 
-                Ok(InferenceFeedback::Continue)
+        match res {
+            Ok(stats) => {
+                if args.stats {
+                    println!();
+                    println!("{}", stats);
+                    println!();
+                }
             }
-            _ => Ok(InferenceFeedback::Continue),
-        },
-    );
-    println!();
-
-    match res {
-        Ok(stats) => {
-            if args.stats {
-                println!();
-                println!("{}", stats);
-                println!();
+            Err(llm::InferenceError::ContextFull) => {
+                log::warn!("Context window full, stopping inference.")
+            }
+            Err(llm::InferenceError::TokenizationFailed(err)) => {
+                log::error!("A tokenization-related failure occurred: {}", err);
+            }
+            Err(llm::InferenceError::SamplerFailure(err)) => {
+                log::error!("A sampling-related failure occurred: {}", err);
+            }
+            Err(llm::InferenceError::UserCallback(_)) | Err(llm::InferenceError::EndOfText) => {
+                unreachable!("cannot fail")
             }
         }
-        Err(InferenceError::ContextFull) => {
-            log::warn!("Context window full, stopping inference.")
-        }
-        Err(InferenceError::TokenizationFailed(err)) => {
-            log::error!("A tokenization-related failure occurred: {}", err);
-        }
-        Err(InferenceError::UserCallback(_)) | Err(InferenceError::EndOfText) => {
-            unreachable!("cannot fail")
-        }
-    }
+    });
 
     if let Some(session_path) = args.save_session.as_ref().or(args.persist_session.as_ref()) {
         // Write the memory to the cache file
@@ -105,34 +113,24 @@ fn infer(args: &cli_args::Infer) -> Result<()> {
     Ok(())
 }
 
-fn perplexity(args: &cli_args::Perplexity) -> Result<()> {
+fn perplexity(args: &cli_args::Perplexity) -> eyre::Result<()> {
     let prompt = load_prompt_file_with_prompt(&args.prompt_file, args.prompt.as_deref())?;
     let inference_session_config = args.generate.inference_session_config();
     let model = args.model_load.load(args.generate.use_gpu)?;
-    let (mut session, _) = snapshot::read_or_create_session(
-        model.as_ref(),
-        None,
-        args.generate.load_session.as_deref(),
-        inference_session_config,
-    );
-    let parameters = args.generate.inference_parameters(model.eot_token_id());
+    let (mut session, _) =
+        snapshot::read_or_create_session(model.as_ref(), None, None, inference_session_config);
 
-    session.perplexity(
-        model.as_ref(),
-        &parameters,
-        prompt.as_str(),
-        |chunk, perplexity| {
-            println!("Perplexity[{chunk}]: {perplexity}");
-        },
-    )?;
+    session.perplexity(model.as_ref(), prompt.as_str(), |chunk, perplexity| {
+        println!("Perplexity[{chunk}]: {perplexity}");
+    })?;
 
     Ok(())
 }
 
-fn info(args: &cli_args::Info) -> Result<()> {
+fn info(args: &cli_args::Info) -> eyre::Result<()> {
     struct InfoVisitor<'a>(&'a cli_args::Info);
-    impl llm::ModelArchitectureVisitor<Result<()>> for InfoVisitor<'_> {
-        fn visit<M: llm::KnownModel + 'static>(&mut self) -> Result<()> {
+    impl llm::ModelArchitectureVisitor<eyre::Result<()>> for InfoVisitor<'_> {
+        fn visit<M: llm::KnownModel + 'static>(&mut self) -> eyre::Result<()> {
             let args = self.0;
 
             let model_path = &args.model_and_tokenizer.model_path;
@@ -182,7 +180,7 @@ fn info(args: &cli_args::Info) -> Result<()> {
         .visit(&mut InfoVisitor(args))
 }
 
-fn prompt_tokens(args: &cli_args::PromptTokens) -> Result<()> {
+fn prompt_tokens(args: &cli_args::PromptTokens) -> eyre::Result<()> {
     let prompt = load_prompt_file_with_prompt(&args.prompt_file, args.prompt.as_deref())?;
     let model = args.model_load.load(false)?;
     let toks = match model.tokenizer().tokenize(&prompt, false) {
@@ -211,136 +209,12 @@ fn prompt_tokens(args: &cli_args::PromptTokens) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn force_newline_event_seq() -> KeyEvent {
-    KeyEvent(KeyCode::Enter, Modifiers::ALT)
-}
-
-// On Windows, `SHIFT+ENTER` is the key sequence for forcing a newline. This is
-// because `ALT+ENTER` typically maximizes the window.
-#[cfg(windows)]
-fn force_newline_event_seq() -> KeyEvent {
-    KeyEvent(KeyCode::Enter, Modifiers::SHIFT)
-}
-
-fn repl(args: &cli_args::Repl) -> Result<()> {
-    interactive(
-        &args.generate,
-        &args.model_load,
-        args.prompt_file.contents()?.as_deref(),
-        None,
-    )
-}
-
-fn chat(args: &cli_args::Chat) -> Result<()> {
-    interactive(
-        &args.generate,
-        &args.model_load,
-        Some(std::fs::read_to_string(&args.prelude_prompt_file)?.as_str()),
-        Some(&args.message_prompt()?),
-    )
-}
-
-fn interactive(
-    generate: &cli_args::Generate,
-    model_load: &cli_args::ModelLoad,
-    initial_prompt_template: Option<&str>,
-    message_prompt_template: Option<&str>,
-) -> Result<()> {
-    let inference_session_config = generate.inference_session_config();
-    let model = model_load.load(generate.use_gpu)?;
-
-    let (mut session, mut session_loaded) = snapshot::read_or_create_session(
-        model.as_ref(),
-        None,
-        generate.load_session.as_deref(),
-        inference_session_config,
-    );
-    let parameters = generate.inference_parameters(model.eot_token_id());
-
-    let mut rng = generate.rng();
-
-    let mut rl = rustyline::Editor::<LineContinuationValidator, DefaultHistory>::new()?;
-    rl.set_helper(Some(LineContinuationValidator));
-    rl.bind_sequence(force_newline_event_seq(), Cmd::Newline);
-    loop {
-        let readline = rl.readline(">> ");
-        match readline {
-            Ok(raw_line) => {
-                let line = raw_line.replace("\\\n", "\n");
-
-                let prompt = message_prompt_template
-                    .or(initial_prompt_template)
-                    .map(|pf| process_prompt(pf, &line))
-                    .unwrap_or(line);
-
-                let sp = spinoff::Spinner::new(spinoff::spinners::Dots2, "".to_string(), None);
-                if let Err(InferenceError::ContextFull) = session.feed_prompt(
-                    model.as_ref(),
-                    &parameters,
-                    &prompt,
-                    // OutputRequest
-                    &mut Default::default(),
-                    |_| Ok::<_, Infallible>(InferenceFeedback::Continue),
-                ) {
-                    log::error!("Prompt exceeds context window length.")
-                };
-                sp.clear();
-
-                let res = session.infer::<Infallible>(
-                    model.as_ref(),
-                    &mut rng,
-                    &llm::InferenceRequest {
-                        prompt: "".into(),
-                        parameters: &parameters,
-                        play_back_previous_tokens: session_loaded,
-                        maximum_token_count: generate.num_predict,
-                    },
-                    // EvaluateOuputRequest
-                    &mut Default::default(),
-                    |r| match r {
-                        InferenceResponse::PromptToken(t) | InferenceResponse::InferredToken(t) => {
-                            print!("{t}");
-                            std::io::stdout().flush().unwrap();
-
-                            Ok(InferenceFeedback::Continue)
-                        }
-                        _ => Ok(InferenceFeedback::Continue),
-                    },
-                );
-                println!();
-
-                if let Err(InferenceError::ContextFull) = res {
-                    log::error!("Reply exceeds context window length");
-                }
-
-                // Reload session in REPL mode
-                if message_prompt_template.is_none() {
-                    (session, session_loaded) = snapshot::read_or_create_session(
-                        model.as_ref(),
-                        None,
-                        generate.load_session.as_deref(),
-                        inference_session_config,
-                    );
-                }
-            }
-            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
-                break;
-            }
-            Err(err) => {
-                log::error!("{err}");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn quantize(args: &cli_args::Quantize) -> Result<()> {
+fn quantize(args: &cli_args::Quantize) -> eyre::Result<()> {
     use llm::QuantizeProgress;
 
     struct QuantizeVisitor<'a>(&'a cli_args::Quantize);
-    impl llm::ModelArchitectureVisitor<Result<()>> for QuantizeVisitor<'_> {
-        fn visit<M: llm::KnownModel>(&mut self) -> Result<()> {
+    impl llm::ModelArchitectureVisitor<eyre::Result<()>> for QuantizeVisitor<'_> {
+        fn visit<M: llm::KnownModel>(&mut self) -> eyre::Result<()> {
             let args = self.0;
 
             let mut source: BufReader<File> = BufReader::new(std::fs::File::open(&args.source)?);
@@ -398,33 +272,11 @@ fn quantize(args: &cli_args::Quantize) -> Result<()> {
 fn load_prompt_file_with_prompt(
     prompt_file: &cli_args::PromptFile,
     prompt: Option<&str>,
-) -> Result<String> {
-    Ok(if let Some(prompt_file) = prompt_file.contents()? {
-        if let Some(prompt) = prompt {
-            process_prompt(&prompt_file, prompt)
-        } else {
-            prompt_file
-        }
-    } else if let Some(prompt) = prompt {
-        prompt.to_owned()
-    } else {
-        bail!("No prompt or prompt file was provided. See --help");
+) -> eyre::Result<String> {
+    Ok(match (prompt_file.contents()?, prompt) {
+        (Some(prompt_file), None) => prompt_file,
+        (None, Some(prompt)) => prompt.to_owned(),
+        (Some(prompt_file), Some(prompt)) => util::process_prompt(&prompt_file, prompt),
+        (None, None) => eyre::bail!("No prompt or prompt file was provided. See --help"),
     })
-}
-
-#[derive(Completer, Helper, Highlighter, Hinter, Debug, Clone, Copy)]
-struct LineContinuationValidator;
-
-impl Validator for LineContinuationValidator {
-    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        if ctx.input().ends_with('\\') {
-            Ok(ValidationResult::Incomplete)
-        } else {
-            Ok(ValidationResult::Valid(None))
-        }
-    }
-}
-
-fn process_prompt(raw_prompt: &str, prompt: &str) -> String {
-    raw_prompt.replace("{{PROMPT}}", prompt)
 }

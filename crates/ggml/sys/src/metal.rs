@@ -17,10 +17,13 @@ pub struct ggml_metal_context {
     _unused: [u8; 0],
 }
 extern "C" {
-    pub fn ggml_metal_init() -> *mut ggml_metal_context;
+    pub fn ggml_metal_init(n_cb: ::std::os::raw::c_int) -> *mut ggml_metal_context;
 }
 extern "C" {
     pub fn ggml_metal_free(ctx: *mut ggml_metal_context);
+}
+extern "C" {
+    pub fn ggml_metal_set_n_cb(ctx: *mut ggml_metal_context, n_cb: ::std::os::raw::c_int);
 }
 extern "C" {
     pub fn ggml_metal_add_buffer(
@@ -36,6 +39,12 @@ extern "C" {
 }
 extern "C" {
     pub fn ggml_metal_get_tensor(ctx: *mut ggml_metal_context, t: *mut ggml_tensor);
+}
+extern "C" {
+    pub fn ggml_metal_graph_find_concurrency(ctx: *mut ggml_metal_context, gf: *mut ggml_cgraph);
+}
+extern "C" {
+    pub fn ggml_metal_if_optimized(ctx: *mut ggml_metal_context) -> bool;
 }
 extern "C" {
     pub fn ggml_metal_graph_compute(ctx: *mut ggml_metal_context, gf: *mut ggml_cgraph);

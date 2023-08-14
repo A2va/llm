@@ -7,12 +7,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ggml::accelerator::Backend;
 use regex::Regex;
 use thiserror::Error;
 
 use crate::{
-    loader::TensorLoader, tokenizer::TokenId, FileType, InferenceParameters, InferenceSession,
-    InferenceSessionConfig, LoadError, LoadProgress, Tokenizer, TokenizerSource,
+    loader::TensorLoader, tokenizer::TokenId, FileType, InferenceSession, InferenceSessionConfig,
+    LoadError, LoadProgress, Tokenizer, TokenizerSource,
 };
 
 /// Common functions for model evaluation
@@ -54,13 +55,12 @@ pub trait KnownModel: Send + Sync {
     fn start_session(&self, config: InferenceSessionConfig) -> InferenceSession;
 
     /// This function is called by the provided [InferenceSession]; it will use this model
-    /// and the [InferenceParameters] to generate output by evaluating the `input_tokens`.
+    /// to generate output by evaluating the `input_tokens`.
     /// The [OutputRequest] is used to specify additional data to fetch from the
     /// model.
     fn evaluate(
         &self,
         session: &mut InferenceSession,
-        params: &InferenceParameters,
         input_tokens: &[TokenId],
         output_request: &mut OutputRequest,
     );
@@ -86,6 +86,12 @@ pub trait KnownModel: Send + Sync {
 
     /// Get the list of regexes to use to determine if a tensor in this model should not be quantized.
     fn skip_quantize_tensors() -> Vec<Regex>;
+
+    /// Returns whether the model supports deleting tokens.
+    fn supports_rewind(&self) -> bool {
+        // Assume we can't delete unless otherwise specified
+        false
+    }
 }
 
 /// A type-erased model to allow for interacting with a model without knowing
@@ -95,13 +101,12 @@ pub trait Model: Send + Sync {
     fn start_session(&self, config: InferenceSessionConfig) -> InferenceSession;
 
     /// This function is called by the provided [InferenceSession]; it will use this model
-    /// and the [InferenceParameters] to generate output by evaluating the `input_tokens`.
+    /// to generate output by evaluating the `input_tokens`.
     /// The [OutputRequest] is used to specify additional data to fetch from the
     /// model.
     fn evaluate(
         &self,
         session: &mut InferenceSession,
-        params: &InferenceParameters,
         input_tokens: &[TokenId],
         output_request: &mut OutputRequest,
     );
@@ -118,6 +123,9 @@ pub trait Model: Send + Sync {
 
     /// Get the end of text/end of string token ID. This value is defined by model implementers.
     fn eot_token_id(&self) -> TokenId;
+
+    /// Returns whether the model supports deleting tokens.
+    fn supports_rewind(&self) -> bool;
 }
 impl<H: Hyperparameters, M: KnownModel<Hyperparameters = H>> Model for M {
     fn start_session(&self, config: InferenceSessionConfig) -> InferenceSession {
@@ -127,11 +135,10 @@ impl<H: Hyperparameters, M: KnownModel<Hyperparameters = H>> Model for M {
     fn evaluate(
         &self,
         session: &mut InferenceSession,
-        params: &InferenceParameters,
         input_tokens: &[TokenId],
         output_request: &mut OutputRequest,
     ) {
-        KnownModel::evaluate(self, session, params, input_tokens, output_request)
+        KnownModel::evaluate(self, session, input_tokens, output_request)
     }
 
     fn tokenizer(&self) -> &Tokenizer {
@@ -148,6 +155,10 @@ impl<H: Hyperparameters, M: KnownModel<Hyperparameters = H>> Model for M {
 
     fn eot_token_id(&self) -> TokenId {
         KnownModel::eot_token_id(self)
+    }
+
+    fn supports_rewind(&self) -> bool {
+        KnownModel::supports_rewind(self)
     }
 }
 
@@ -194,6 +205,10 @@ pub struct ModelParameters {
     pub lora_adapters: Option<Vec<PathBuf>>,
     /// Whether to use GPU acceleration when available
     pub use_gpu: bool,
+    /// If `use_gpu` is active this defines the number of layers to offload to the gpu. If `None`, all layers will be offloaded.
+    pub gpu_layers: Option<usize>,
+    /// The arguments/overrides to pass to the [custom RoPE](https://arxiv.org/pdf/2306.15595.pdf) function, if it is used by the model.
+    pub rope_overrides: Option<ggml::RoPEOverrides>,
 }
 
 impl Default for ModelParameters {
@@ -203,6 +218,30 @@ impl Default for ModelParameters {
             context_size: 2048,
             lora_adapters: None,
             use_gpu: false,
+            gpu_layers: None,
+            rope_overrides: None,
+        }
+    }
+}
+
+impl ModelParameters {
+    /// Returns true if the model should offload the given layer to the accelerator.
+    pub fn should_offload(&self, layer: usize) -> bool {
+        if !self.use_gpu {
+            return false;
+        }
+
+        self.gpu_layers
+            .map(|gpu_layers| layer < gpu_layers)
+            .unwrap_or(true)
+    }
+
+    /// Returns the backend to use for the given layer.
+    pub fn backend(&self, layer: usize) -> Backend {
+        if self.should_offload(layer) {
+            Backend::Gpu
+        } else {
+            Backend::Cpu
         }
     }
 }

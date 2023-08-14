@@ -230,6 +230,14 @@ impl Prompt<'_> {
             }
         })
     }
+
+    /// Returns whether this prompt is empty.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(text) => text.is_empty(),
+            Self::Tokens(tokens) => tokens.is_empty(),
+        }
+    }
 }
 impl<'a> Default for Prompt<'a> {
     fn default() -> Self {
@@ -287,6 +295,12 @@ impl TokenBias {
             .binary_search_by_key(&tid, |(tid, _)| *tid)
             .map(|idx| self.0[idx].1)
             .ok()
+    }
+}
+
+impl From<TokenBias> for Vec<(TokenId, f32)> {
+    fn from(val: TokenBias) -> Self {
+        val.0
     }
 }
 
