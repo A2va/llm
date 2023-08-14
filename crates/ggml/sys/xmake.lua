@@ -90,6 +90,9 @@ target("ggml")
 
     if has_config("cublas") then 
         add_packages("cuda")
+        add_cugencodes("sm_35", "sm_61")
+        add_cugencodes("compute_52", "compute_61")
+
         add_files("llama-cpp/ggml-cuda.cu")
         add_headerfiles("llama-cpp/ggml-cuda.h")
 		add_defines("GGML_USE_CUBLAS")
