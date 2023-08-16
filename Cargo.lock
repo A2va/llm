@@ -3003,9 +3003,9 @@ dependencies = [
 
 [[package]]
 name = "xmake"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb2586e41b4e1bff2dd8fa01cc5f5f5c334a9ac23ee2c56650e040fa3c7d2c2a"
+checksum = "5588a28fb882a0088920cd0cb10cc398f72b30f1ad2baab89f7d7fe33087e45d"
 dependencies = [
  "cc",
 ]

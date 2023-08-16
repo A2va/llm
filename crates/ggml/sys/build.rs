@@ -10,6 +10,7 @@ fn main() {
     verify_state();
 
     println!("cargo:rerun-if-changed=llama-cpp");
+    println!("cargo:rerun-if-changed=xmake.lua");
 
     let target = "ggml";
     let mut config = Config::new("llama-cpp");

@@ -49,12 +49,8 @@ target("ggml")
     set_kind("static")
     set_languages("cxx11","c11")
 
-    add_headerfiles("llama-cpp/ggml.h")
-    add_files("llama-cpp/ggml.c")
-    if os.exists("llama-cpp/ggml-alloc.h") then
-        add_files("llama-cpp/ggml-alloc.c")
-        add_headerfiles("llama-cpp/ggml-alloc.h")
-    end
+    add_headerfiles("llama-cpp/ggml.h", "llama-cpp/ggml-alloc.h")
+    add_files("llama-cpp/ggml.c", "llama-cpp/ggml-alloc.c")
 
     if is_plat("linux", "macosx") then 
         add_cflags("-pthread")
