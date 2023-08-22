@@ -29,7 +29,12 @@ end
 
 option_callback("clblast", "clblast", add_requires)
 option_callback("openblas", "openblas", add_requires)
-option_callback("cublas", "cuda", add_requires)
+if has_config("cublas") then
+    add_requires("cuda", {configs = {utils = {"cublas"}}})
+end
+-- option_callback("cublas", "cuda", add_requires)
+
+set_policy("build.cuda.devlink", true)
 
 target("ggml")
 
@@ -86,8 +91,11 @@ target("ggml")
 
     if has_config("cublas") then 
         add_packages("cuda")
-        add_cugencodes("sm_35", "sm_61")
-        add_cugencodes("compute_52", "compute_61")
+        -- add_cugencodes("sm_35", "sm_61")
+        -- add_cugencodes("compute_52", "compute_61")
+        add_cuflags("--generate-code=arch=compute_52,code=[compute_52,sm_52]")
+        add_cuflags("--generate-code=arch=compute_61,code=[compute_61,sm_61]")
+
 
         add_files("llama-cpp/ggml-cuda.cu")
         add_headerfiles("llama-cpp/ggml-cuda.h")

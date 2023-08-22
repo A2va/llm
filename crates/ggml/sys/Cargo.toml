@@ -8,7 +8,8 @@ license = "MIT"
 
 [build-dependencies]
 cc = "^1.0"
-xmake = "^0.2"
+#xmake = "^0.2"
+xmake = { git = "https://github.com/A2va/xmake-rs.git", branch = "detect-crt" }
 
 [features]
 cublas = []
