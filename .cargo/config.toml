@@ -1,3 +1,0 @@
-[build]
-# rustflags = ["-C", "link-args=/VERBOSE:LIB"]
-rustflags = ["-C", "link-args=/NODEFAULTLIB:libcmt.lib /NODEFAULTLIB:libcmtd.lib /NODEFAULTLIB:msvcrtd.lib"]
